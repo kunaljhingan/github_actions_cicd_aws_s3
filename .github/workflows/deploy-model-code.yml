@@ -11,7 +11,6 @@ on:
   workflow_dispatch:
 
 permissions:
-  id-token: write
   contents: read
 
 concurrency:
@@ -37,26 +36,58 @@ jobs:
 
     steps:
 
+      # ----------------------------------------
+      # 1. Download code from GitHub repository
+      # ----------------------------------------
+
       - name: Checkout repository
         uses: actions/checkout@v7
 
+
+      # ----------------------------------------
+      # 2. Validate score_if_else.py
+      # ----------------------------------------
 
       - name: Validate model file
         run: |
           set -euo pipefail
 
+          echo "Checking model file..."
+
           test -f "$MODEL_FILE"
 
           python -m py_compile "$MODEL_FILE"
 
+          echo "Model Python syntax is valid."
+
+
+      # ----------------------------------------
+      # 3. Authenticate GitHub Actions to AWS
+      # ----------------------------------------
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6.3.0
-
         with:
-          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
           aws-region: ${{ env.AWS_REGION }}
 
+
+      # ----------------------------------------
+      # 4. Verify AWS authentication
+      # ----------------------------------------
+
+      - name: Verify AWS identity
+        run: |
+          aws sts get-caller-identity
+
+
+      # ----------------------------------------
+      # 5. Upload model code to S3
+      # ----------------------------------------
 
       - name: Upload model artifact to S3
         run: |
@@ -68,14 +99,16 @@ jobs:
           LATEST_URI="s3://$DEPLOY_BUCKET/$DEPLOY_PREFIX/latest/score_if_else.py"
 
 
-          echo "Uploading release..."
+          echo "Uploading release:"
+          echo "$RELEASE_URI"
+
 
           aws s3 cp \
             "$MODEL_FILE" \
             "$RELEASE_URI"
 
 
-          echo "Updating latest..."
+          echo "Updating latest model..."
 
           aws s3 cp \
             "$MODEL_FILE" \
@@ -85,7 +118,11 @@ jobs:
           echo "RELEASE_URI=$RELEASE_URI" >> "$GITHUB_ENV"
 
 
-      - name: Deploy model file to EC2
+      # ----------------------------------------
+      # 6. Tell EC2 to download the new code
+      # ----------------------------------------
+
+      - name: Deploy model code to EC2
         env:
 
           EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
@@ -104,21 +141,31 @@ jobs:
 
               "set -euo pipefail",
 
+              "echo 'Downloading model from S3...'",
+
               "aws s3 cp '${RELEASE_URI}' '${TMP_PATH}'",
+
+              "echo 'Checking Python syntax...'",
 
               "python3 -m py_compile '${TMP_PATH}'",
 
+              "echo 'Backing up current model...'",
+
               "if [ -f '${EC2_MODEL_PATH}' ]; then cp -p '${EC2_MODEL_PATH}' '${EC2_MODEL_PATH}.bak'; fi",
+
+              "echo 'Installing new model...'",
 
               "install -m 0644 '${TMP_PATH}' '${EC2_MODEL_PATH}'",
 
               "rm -f '${TMP_PATH}'",
 
+              "echo 'Installed model:'",
+
               "ls -lh '${EC2_MODEL_PATH}'",
 
               "sha256sum '${EC2_MODEL_PATH}'",
 
-              "echo 'Model code deployment completed successfully'"
+              "echo 'Model deployment completed successfully'"
 
             ]
           }
@@ -129,7 +176,7 @@ jobs:
             --region "$AWS_REGION" \
             --instance-ids "$EC2_INSTANCE_ID" \
             --document-name "AWS-RunShellScript" \
-            --comment "Deploy score_if_else.py from GitHub ${GITHUB_SHA}" \
+            --comment "Deploy model from GitHub commit ${GITHUB_SHA}" \
             --parameters file://ssm-commands.json \
             --query "Command.CommandId" \
             --output text)
@@ -138,6 +185,7 @@ jobs:
           echo "SSM Command ID: $COMMAND_ID"
 
 
+          # Wait for EC2 deployment
           set +e
 
           aws ssm wait command-executed \
@@ -150,6 +198,7 @@ jobs:
           set -e
 
 
+          # Show output from EC2
           aws ssm get-command-invocation \
             --region "$AWS_REGION" \
             --command-id "$COMMAND_ID" \
