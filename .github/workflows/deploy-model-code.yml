@@ -1,210 +1,164 @@
-name: Deploy scoring model code to EC2
+name: Deploy model code
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
     paths:
       - "model_ec2_docker/score_if_else.py"
+      - "tests/**"
+      - "requirements-dev.txt"
       - ".github/workflows/deploy-model-code.yml"
-
   workflow_dispatch:
 
 permissions:
   contents: read
 
-concurrency:
-  group: model-code-production
-  cancel-in-progress: false
-
 env:
   AWS_REGION: ap-southeast-2
-
   MODEL_FILE: model_ec2_docker/score_if_else.py
-
-  DEPLOY_BUCKET: data.snowflake
-  DEPLOY_PREFIX: model-code
-
+  RELEASE_S3_PREFIX: s3://data.snowflake/model-code/releases
+  LATEST_S3_URI: s3://data.snowflake/model-code/latest/score_if_else.py
   EC2_MODEL_PATH: /home/ec2-user/model_ec2_docker/score_if_else.py
-
+  EC2_VENV_PYTHON: /home/ec2-user/model_ec2_docker/.venv/bin/python
 
 jobs:
-
-  deploy-model-code:
-
+  verify-main:
+    name: Verify main before deploy
     runs-on: ubuntu-latest
-
     steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+      - run: python -m pytest -q
 
-      # ----------------------------------------
-      # 1. Download code from GitHub repository
-      # ----------------------------------------
+  deploy:
+    name: Deploy and EC2 smoke test
+    needs: verify-main
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
 
-      - name: Checkout repository
-        uses: actions/checkout@v7
-
-
-      # ----------------------------------------
-      # 2. Validate score_if_else.py
-      # ----------------------------------------
-
-      - name: Validate model file
+      - name: Validate EC2 instance variable
+        shell: bash
         run: |
-          set -euo pipefail
-
-          echo "Checking model file..."
-
-          test -f "$MODEL_FILE"
-
-          python -m py_compile "$MODEL_FILE"
-
-          echo "Model Python syntax is valid."
-
-
-      # ----------------------------------------
-      # 3. Authenticate GitHub Actions to AWS
-      # ----------------------------------------
+          if [[ ! "${{ vars.EC2_INSTANCE_ID }}" =~ ^i-[0-9a-fA-F]{8}([0-9a-fA-F]{9})?$ ]]; then
+            echo "EC2_INSTANCE_ID repository variable is missing or invalid."
+            exit 1
+          fi
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6.3.0
         with:
-
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-
           aws-region: ${{ env.AWS_REGION }}
 
-
-      # ----------------------------------------
-      # 4. Verify AWS authentication
-      # ----------------------------------------
-
-      - name: Verify AWS identity
+      - name: Upload immutable release artifact
+        id: release
+        shell: bash
         run: |
-          aws sts get-caller-identity
-
-
-      # ----------------------------------------
-      # 5. Upload model code to S3
-      # ----------------------------------------
-
-      - name: Upload model artifact to S3
-        run: |
-
           set -euo pipefail
+          RELEASE_URI="${RELEASE_S3_PREFIX}/${GITHUB_SHA}/score_if_else.py"
+          LOCAL_SHA="$(sha256sum "${MODEL_FILE}" | awk '{print $1}')"
+          aws s3 cp "${MODEL_FILE}" "${RELEASE_URI}"
+          echo "release_uri=${RELEASE_URI}" >> "$GITHUB_OUTPUT"
+          echo "local_sha=${LOCAL_SHA}" >> "$GITHUB_OUTPUT"
 
-          RELEASE_URI="s3://$DEPLOY_BUCKET/$DEPLOY_PREFIX/releases/${GITHUB_SHA}/score_if_else.py"
-
-          LATEST_URI="s3://$DEPLOY_BUCKET/$DEPLOY_PREFIX/latest/score_if_else.py"
-
-
-          echo "Uploading release:"
-          echo "$RELEASE_URI"
-
-
-          aws s3 cp \
-            "$MODEL_FILE" \
-            "$RELEASE_URI"
-
-
-          echo "Updating latest model..."
-
-          aws s3 cp \
-            "$MODEL_FILE" \
-            "$LATEST_URI"
-
-
-          echo "RELEASE_URI=$RELEASE_URI" >> "$GITHUB_ENV"
-
-
-      # ----------------------------------------
-      # 6. Tell EC2 to download the new code
-      # ----------------------------------------
-
-      - name: Deploy model code to EC2
+      - name: Deploy to EC2 and run deployment smoke test
+        shell: bash
         env:
-
           EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
-
+          RELEASE_URI: ${{ steps.release.outputs.release_uri }}
+          EXPECTED_SHA: ${{ steps.release.outputs.local_sha }}
         run: |
-
           set -euo pipefail
 
+          read -r -d '' REMOTE_COMMAND <<EOF || true
+          set -euo pipefail
+          MODEL_PATH="${EC2_MODEL_PATH}"
+          TMP_MODEL="/tmp/score_if_else.${GITHUB_SHA}.py"
+          BACKUP_PATH="\${MODEL_PATH}.pre_${GITHUB_SHA}"
+          PYTHON_BIN="${EC2_VENV_PYTHON}"
+          if [ ! -x "\${PYTHON_BIN}" ]; then PYTHON_BIN="\$(command -v python3)"; fi
 
-          TMP_PATH="/tmp/score_if_else.${GITHUB_SHA}.py"
+          aws s3 cp "${RELEASE_URI}" "\${TMP_MODEL}"
+          ACTUAL_SHA="\$(sha256sum "\${TMP_MODEL}" | awk '{print \$1}')"
+          test "\${ACTUAL_SHA}" = "${EXPECTED_SHA}"
+          "\${PYTHON_BIN}" -m py_compile "\${TMP_MODEL}"
 
+          "\${PYTHON_BIN}" - "\${TMP_MODEL}" <<'PY'
+          import importlib.util, math, sys
+          import pandas as pd
+          p = sys.argv[1]
+          spec = importlib.util.spec_from_file_location("score_if_else_candidate", p)
+          assert spec is not None and spec.loader is not None
+          scorer = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(scorer)
+          assert hasattr(scorer, "FEATURE_NAMES") and len(scorer.FEATURE_NAMES) > 0
+          assert callable(scorer.score_dataframe)
+          df = pd.DataFrame([{name: 1.0 for name in scorer.FEATURE_NAMES}])
+          result = scorer.score_dataframe(df)
+          required = {"prediction_margin", "probability", "prediction", "score"}
+          assert required.issubset(result.columns)
+          assert len(result) == 1
+          assert 0.0 <= float(result.iloc[0]["probability"]) <= 1.0
+          assert int(result.iloc[0]["prediction"]) in (0, 1)
+          assert math.isfinite(float(result.iloc[0]["prediction_margin"]))
+          assert math.isfinite(float(result.iloc[0]["score"]))
+          print("CANDIDATE_SMOKE_OK")
+          PY
 
-          cat > ssm-commands.json <<EOF
-          {
-            "commands": [
-
-              "set -euo pipefail",
-
-              "echo 'Downloading model from S3...'",
-
-              "aws s3 cp '${RELEASE_URI}' '${TMP_PATH}'",
-
-              "echo 'Checking Python syntax...'",
-
-              "python3 -m py_compile '${TMP_PATH}'",
-
-              "echo 'Backing up current model...'",
-
-              "if [ -f '${EC2_MODEL_PATH}' ]; then cp -p '${EC2_MODEL_PATH}' '${EC2_MODEL_PATH}.bak'; fi",
-
-              "echo 'Installing new model...'",
-
-              "install -m 0644 '${TMP_PATH}' '${EC2_MODEL_PATH}'",
-
-              "rm -f '${TMP_PATH}'",
-
-              "echo 'Installed model:'",
-
-              "ls -lh '${EC2_MODEL_PATH}'",
-
-              "sha256sum '${EC2_MODEL_PATH}'",
-
-              "echo 'Model deployment completed successfully'"
-
-            ]
-          }
+          mkdir -p "\$(dirname "\${MODEL_PATH}")"
+          if [ -f "\${MODEL_PATH}" ]; then cp "\${MODEL_PATH}" "\${BACKUP_PATH}"; fi
+          cp "\${TMP_MODEL}" "\${MODEL_PATH}"
+          chown ec2-user:ec2-user "\${MODEL_PATH}" || true
+          chmod 0644 "\${MODEL_PATH}"
+          INSTALLED_SHA="\$(sha256sum "\${MODEL_PATH}" | awk '{print \$1}')"
+          if [ "\${INSTALLED_SHA}" != "${EXPECTED_SHA}" ]; then
+            if [ -f "\${BACKUP_PATH}" ]; then cp "\${BACKUP_PATH}" "\${MODEL_PATH}"; fi
+            exit 1
+          fi
+          "\${PYTHON_BIN}" -m py_compile "\${MODEL_PATH}"
+          if [ -f /home/ec2-user/run_scoring.sh ]; then bash -n /home/ec2-user/run_scoring.sh; fi
+          rm -f "\${TMP_MODEL}"
+          echo "DEPLOY_SMOKE_OK"
           EOF
 
+          python - "$REMOTE_COMMAND" <<'PY' > ssm-parameters.json
+          import json, sys
+          print(json.dumps({"commands": [sys.argv[1]]}))
+          PY
 
           COMMAND_ID=$(aws ssm send-command \
-            --region "$AWS_REGION" \
-            --instance-ids "$EC2_INSTANCE_ID" \
+            --instance-ids "${EC2_INSTANCE_ID}" \
             --document-name "AWS-RunShellScript" \
-            --comment "Deploy model from GitHub commit ${GITHUB_SHA}" \
-            --parameters file://ssm-commands.json \
-            --query "Command.CommandId" \
-            --output text)
+            --comment "Deploy scorer ${GITHUB_SHA} and run smoke test" \
+            --parameters file://ssm-parameters.json \
+            --query "Command.CommandId" --output text)
 
+          STATUS=""
+          for attempt in $(seq 1 60); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "${COMMAND_ID}" \
+              --instance-id "${EC2_INSTANCE_ID}" \
+              --query "Status" --output text 2>/dev/null || true)
+            case "${STATUS}" in Success|Failed|TimedOut|Cancelled|Cancelling) break ;; esac
+            sleep 5
+          done
 
-          echo "SSM Command ID: $COMMAND_ID"
-
-
-          # Wait for EC2 deployment
-          set +e
-
-          aws ssm wait command-executed \
-            --region "$AWS_REGION" \
-            --command-id "$COMMAND_ID" \
-            --instance-id "$EC2_INSTANCE_ID"
-
-          WAIT_RC=$?
-
-          set -e
-
-
-          # Show output from EC2
           aws ssm get-command-invocation \
-            --region "$AWS_REGION" \
-            --command-id "$COMMAND_ID" \
-            --instance-id "$EC2_INSTANCE_ID" \
-            --query \
-            '{Status:Status,ResponseCode:ResponseCode,Stdout:StandardOutputContent,Stderr:StandardErrorContent}'
+            --command-id "${COMMAND_ID}" \
+            --instance-id "${EC2_INSTANCE_ID}" \
+            --query '{Status:Status,Stdout:StandardOutputContent,Stderr:StandardErrorContent}' \
+            --output json || true
 
+          test "${STATUS}" = "Success"
 
-          exit "$WAIT_RC"
+      - name: Promote successful release to latest
+        run: aws s3 cp "${MODEL_FILE}" "${LATEST_S3_URI}"
